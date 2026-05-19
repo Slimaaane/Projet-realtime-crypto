@@ -111,7 +111,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <div class="header-bar">
   <div>
-    <h1>🩺 Health Dashboard — Crypto Pipeline</h1>
+    <h1>Health Dashboard -- Crypto Pipeline</h1>
     <div class="sub">Rafraîchissement automatique toutes les 3 secondes</div>
   </div>
   <div class="live">

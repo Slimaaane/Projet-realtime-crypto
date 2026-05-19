@@ -10,6 +10,9 @@ import redis
 from kafka import KafkaConsumer
 from pymongo import MongoClient
 
+# Chaque worker recoit un ID en argument pour pouvoir etre identifie
+# dans les logs et dans les heartbeats Redis. On lance 8 workers en
+# parallele via start.sh pour repartir la charge de traitement.
 WORKER_ID = sys.argv[1] if len(sys.argv) > 1 else "?"
 
 logging.basicConfig(
@@ -23,11 +26,28 @@ KAFKA_TOPIC  = os.getenv("KAFKA_TOPIC",  "crypto.trades.raw")
 MONGO_URI    = os.getenv("MONGO_URI",    "mongodb://localhost:27017/crypto")
 REDIS_URI    = os.getenv("REDIS_URI",    "redis://localhost:6379")
 
+# On limite le nombre de trades gardes dans Redis pour ne pas exploser
+# la memoire. 500 trades recents suffisent pour le feed du dashboard.
 REDIS_MAX_TRADES   = 500
 REDIS_MAX_ALERTS   = 50
+
+# Les fenetres glissantes servent a calculer les metriques sur differentes
+# periodes. On fait 1min, 5min, 15min et 1h pour avoir une vue a
+# plusieurs echelles de temps, comme sur un vrai terminal de trading.
 WINDOWS            = {"1min": 60, "5min": 300, "15min": 900, "1h": 3600}
+
+# Pour la detection d'anomalies, on utilise un seuil a 3 ecarts-types
+# au-dessus de la moyenne. C'est le seuil classique en statistique
+# (regle des 3 sigma) : tout ce qui depasse est considere comme anormal.
 SIGMA_THRESHOLD    = 3.0
+
+# Le ratio pour les pics de volume : si un trade a un volume 5x superieur
+# a la moyenne, on le considere comme un pic. Ce ratio est ajustable.
 VOLUME_SPIKE_RATIO = 5.0
+
+# Taille du buffer pour le calcul des stats d'anomalies. On garde les
+# 100 derniers trades pour calculer moyenne et ecart-type. Plus le buffer
+# est grand, plus la detection est stable mais moins reactive.
 ANOMALY_BUF_SIZE   = 100
 MIN_SAMPLES        = 10
 
@@ -37,6 +57,9 @@ trades_col   = db["trades"]
 
 r = redis.from_url(REDIS_URI, decode_responses=True)
 
+# On utilise le group_id "group-ingestion" pour que les 8 workers se
+# repartissent les partitions du topic. Comme ca chaque trade n'est
+# traite qu'une seule fois, pas en doublon.
 consumer = KafkaConsumer(
     KAFKA_TOPIC,
     bootstrap_servers=[KAFKA_BROKER],
@@ -45,10 +68,13 @@ consumer = KafkaConsumer(
     auto_offset_reset="latest",
 )
 
+# Buffers en memoire pour le calcul des anomalies. On utilise des deque
+# a taille fixe pour que les anciens prix/volumes soient automatiquement
+# ejectes quand de nouveaux arrivent.
 price_buffer  = deque(maxlen=ANOMALY_BUF_SIZE)
 volume_buffer = deque(maxlen=ANOMALY_BUF_SIZE)
 
-logger.info("Démarré — en attente de messages...")
+logger.info("Demarre -- en attente de messages...")
 
 
 def _mean(vals):
@@ -60,6 +86,9 @@ def _std(vals, avg):
 
 
 def compute_window_stats(trades):
+    """On calcule les statistiques agregees sur une liste de trades :
+    prix moyen, min, max, volume total en quantite et en USD, et
+    nombre de trades. Ces stats alimentent les KPI du dashboard."""
     if not trades:
         return None
     prices = [t["price"]    for t in trades]
@@ -83,10 +112,14 @@ for msg in consumer:
         ts     = trade["timestamp"]
         now_ms = int(time.time() * 1000)
 
-        # Heartbeat individuel du worker (expire après 10s sans activité)
+        # Heartbeat : on signale a Redis que ce worker est vivant.
+        # Le TTL de 10s fait qu'un worker qui ne traite plus rien
+        # sera automatiquement marque comme inactif dans le dashboard.
         r.setex(f"worker:{WORKER_ID}:heartbeat", 10, "1")
 
-        # ── 1. MongoDB — stockage permanent ──────────────────────────────────
+        # -- 1. MongoDB : stockage permanent ---------------------------------
+        # On stocke chaque trade dans MongoDB pour avoir un historique
+        # complet qu'on peut requeter plus tard (analyses, debug, etc).
         doc = {
             "exchange":       trade["exchange"],
             "symbol":         symbol,
@@ -100,19 +133,26 @@ for msg in consumer:
         trades_col.insert_one(doc)
         trade_json = json.dumps({k: v for k, v in doc.items() if k != "_id"})
 
-        # ── 2. Redis — fenêtre glissante + feed trades ────────────────────────
+        # -- 2. Redis : fenetre glissante + feed trades -----------------------
+        # On utilise un sorted set Redis avec le timestamp comme score.
+        # Ca permet de recuperer facilement les trades d'une periode donnee
+        # et de supprimer ceux qui sortent de la fenetre de 1h.
         window_key = f"window:{symbol}"
         pipe = r.pipeline()
         pipe.zadd(window_key, {trade_json: now_ms})
         pipe.zremrangebyscore(window_key, 0, now_ms - 3600 * 1000)
         pipe.lpush("trades:latest", trade_json)
         pipe.ltrim("trades:latest", 0, REDIS_MAX_TRADES - 1)
-        # Compteur throughput (fenêtre 1 seconde)
+        # Compteur de throughput : on garde les ticks de la derniere seconde
+        # dans un sorted set pour calculer le nombre de trades par seconde.
         pipe.zadd("throughput:ticks", {f"{now_ms}-{WORKER_ID}": now_ms})
         pipe.zremrangebyscore("throughput:ticks", 0, now_ms - 1000)
         pipe.execute()
 
-        # ── 3. KPI — prix actuel + variation vs 1h ────────────────────────────
+        # -- 3. KPI : prix actuel + variation vs 1h ---------------------------
+        # On recupere le trade le plus ancien dans la fenetre de 1h pour
+        # calculer la variation de prix. Ca donne un pourcentage de
+        # changement sur la derniere heure, utile pour le dashboard.
         oldest = r.zrangebyscore(window_key, now_ms - 3600 * 1000, "+inf", start=0, num=1)
         change_pct_1h = 0.0
         if oldest:
@@ -127,7 +167,10 @@ for msg in consumer:
             "change_pct_1h": change_pct_1h,
         })
 
-        # ── 4. KPI — agrégations par fenêtre (1min / 5min / 15min / 1h) ──────
+        # -- 4. KPI : agregations par fenetre (1min / 5min / 15min / 1h) ------
+        # Pour chaque fenetre, on recupere tous les trades de la periode
+        # et on calcule les stats. On stocke le resultat dans un hash Redis
+        # que l'API server pourra lire directement.
         stats_pipe = r.pipeline()
         for name, seconds in WINDOWS.items():
             raw    = r.zrangebyscore(window_key, now_ms - seconds * 1000, "+inf")
@@ -137,14 +180,19 @@ for msg in consumer:
                                 mapping={k: str(v) for k, v in stats.items()})
         stats_pipe.execute()
 
-        # ── 5. KPI — trades/seconde ───────────────────────────────────────────
+        # -- 5. KPI : trades/seconde ------------------------------------------
         ticks = r.zcount("throughput:ticks", now_ms - 1000, "+inf")
         r.hset("kpi:throughput", mapping={
             "trades_per_sec": ticks,
             "computed_at":    ts,
         })
 
-        # ── 6. Détection d'anomalies ──────────────────────────────────────────
+        # -- 6. Detection d'anomalies ----------------------------------------
+        # On maintient un buffer glissant de prix et de volumes. Quand on a
+        # assez d'echantillons, on verifie si le trade actuel sort de la norme.
+        # Deux types d'anomalies :
+        # - prix anormal : le prix s'ecarte de plus de 3 ecarts-types
+        # - pic de volume : le volume est 5x superieur a la moyenne
         price_buffer.append(price)
         volume_buffer.append(qty)
 
@@ -159,7 +207,7 @@ for msg in consumer:
                 alert = {
                     "type":      "price_anomaly",
                     "symbol":    symbol,
-                    "message":   f"Prix anormal : {price:.2f}$ ({dev:.1f}σ)",
+                    "message":   f"Prix anormal : {price:.2f}$ ({dev:.1f} sigma)",
                     "price":     price,
                     "timestamp": ts,
                 }
@@ -167,7 +215,7 @@ for msg in consumer:
                 alert = {
                     "type":      "volume_spike",
                     "symbol":    symbol,
-                    "message":   f"Pic de volume : {qty:.6f} (×{qty / avg_v:.1f} la moy.)",
+                    "message":   f"Pic de volume : {qty:.6f} (x{qty / avg_v:.1f} la moy.)",
                     "price":     price,
                     "quantity":  qty,
                     "timestamp": ts,
@@ -177,6 +225,8 @@ for msg in consumer:
                 alert_pipe = r.pipeline()
                 alert_pipe.lpush("alerts:recent", json.dumps(alert))
                 alert_pipe.ltrim("alerts:recent", 0, REDIS_MAX_ALERTS - 1)
+                # On garde aussi un compteur d'anomalies sur 10 min dans un
+                # sorted set pour afficher le nombre total dans le dashboard.
                 alert_pipe.zadd("anomalies:window", {f"{now_ms}-{WORKER_ID}": now_ms})
                 alert_pipe.zremrangebyscore("anomalies:window", 0, now_ms - 600 * 1000)
                 alert_pipe.execute()
@@ -189,7 +239,7 @@ for msg in consumer:
                 })
                 logger.warning(f"ALERTE | {alert['message']}")
 
-        logger.info(f"Trade stocké | {symbol} price={price:.2f}$ qty={qty:.6f}")
+        logger.info(f"Trade stocke | {symbol} price={price:.2f}$ qty={qty:.6f}")
 
     except Exception as e:
-        logger.error(f"Erreur message ignoré: {e}")
+        logger.error(f"Erreur message ignore: {e}")
