@@ -113,6 +113,40 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// Etat de sante complet du pipeline : containers Docker + workers + Binance.
+// On proxy vers le health-dashboard (qui a acces au socket Docker) et on
+// enrichit avec les heartbeats Redis des workers.
+app.get('/api/pipeline', async (req, res) => {
+  try {
+    const workers = {};
+    for (let i = 1; i <= 8; i++) {
+      workers[String(i)] = (await redis.exists(`worker:${i}:heartbeat`)) ? 'active' : 'inactive';
+    }
+
+    const priceData = await redis.hgetall('kpi:price:BTC/USDT');
+    let binanceStatus = 'disconnected';
+    let dataAgeSec = null;
+    if (priceData && priceData.timestamp) {
+      const age = (Date.now() - new Date(priceData.timestamp).getTime()) / 1000;
+      dataAgeSec = Math.round(age * 10) / 10;
+      binanceStatus = age < 10 ? 'connected' : 'disconnected';
+    }
+
+    let containers = {};
+    try {
+      const r = await fetch('http://health-dashboard:8888/api/health');
+      const d = await r.json();
+      containers = d.containers || {};
+    } catch (_) {
+      containers = {};
+    }
+
+    res.json({ containers, workers, binance: { status: binanceStatus, age_sec: dataAgeSec }, computed_at: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Historique des trades depuis MongoDB, pour les periodes plus longues
 // que ce que Redis garde en memoire (Redis ne garde que les 500 derniers).
 app.get('/api/trades/history', async (req, res) => {
@@ -173,6 +207,16 @@ setInterval(async () => {
 
     const rawAlerts = await redis.lrange('alerts:recent', 0, 9);
     data.alerts = rawAlerts.map(a => JSON.parse(a));
+
+    // Latence pipeline : ecart entre l'horodatage du trade sur l'exchange
+    // et le moment ou le worker a ecrit dans Redis. Mesure end-to-end.
+    const btcKpi = data.prices['BTC/USDT'];
+    if (btcKpi && btcKpi.timestamp && btcKpi.trade_ts) {
+      const latency = new Date(btcKpi.timestamp) - new Date(btcKpi.trade_ts);
+      data.latency_ms = (latency > 0 && latency < 30000) ? latency : null;
+    } else {
+      data.latency_ms = null;
+    }
 
     io.emit('realtime', data);
   } catch (err) {

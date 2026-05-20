@@ -49,7 +49,8 @@ def normalize(raw: dict) -> dict:
 def on_message(ws, message):
     raw   = json.loads(message)
     trade = normalize(raw)
-    producer.send(KAFKA_TOPIC, trade)
+    key = trade['trade_id'].encode()
+    producer.send(KAFKA_TOPIC, value=trade, key=key)
     logger.info(f"-> Kafka | price={trade['price']:.2f} qty={trade['quantity']:.6f}")
 
 

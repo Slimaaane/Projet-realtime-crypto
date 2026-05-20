@@ -1,8 +1,6 @@
 const { useState, useEffect, useRef, useMemo } = React;
 
 // -- Icones minimalistes en SVG -----------------------------------------------
-// On utilise des icones inline plutot qu'une librairie externe pour ne pas
-// ajouter de dependance supplementaire juste pour 4 icones.
 const Icon = ({ name, size = 16, stroke = 1.75 }) => {
   const props = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: stroke, strokeLinecap: 'round', strokeLinejoin: 'round' };
   const paths = {
@@ -10,6 +8,7 @@ const Icon = ({ name, size = 16, stroke = 1.75 }) => {
     volume: <><rect x="3" y="10" width="3" height="11" rx="1" /><rect x="9" y="6" width="3" height="15" rx="1" /><rect x="15" y="13" width="3" height="8" rx="1" /></>,
     pulse: <path d="M3 12h4l2-7 4 14 2-7h6" />,
     bell: <><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" /><path d="M10 21a2 2 0 0 0 4 0" /></>,
+    server: <><rect x="2" y="2" width="20" height="8" rx="2" /><rect x="2" y="14" width="20" height="8" rx="2" /><line x1="6" y1="6" x2="6.01" y2="6" /><line x1="6" y1="18" x2="6.01" y2="18" /></>,
   };
   return <svg {...props}>{paths[name]}</svg>;
 };
@@ -33,8 +32,6 @@ const fmtCompact = (n) => {
 const pad2 = (n) => String(n).padStart(2, '0');
 const timeStr = (d) => `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 
-// Moyenne mobile simple calculee cote client pour l'affichage du graphique.
-// On fait ca ici pour ne pas alourdir le serveur avec des calculs purement visuels.
 function sma(arr, window) {
   const out = [];
   for (let i = 0; i < arr.length; i++) {
@@ -47,9 +44,6 @@ function sma(arr, window) {
 }
 
 // -- Graphique SVG custom -----------------------------------------------------
-// On dessine le graphique directement en SVG plutot que d'utiliser Chart.js
-// pour garder le controle total sur le rendu et le style, et parce que
-// ca donne un controle total sur le rendu et le style.
 function PriceChart({ series, smaShort, smaLong }) {
   const ref = useRef(null);
   const [size, setSize] = useState({ w: 800, h: 320 });
@@ -213,15 +207,206 @@ function HealthRow({ status, name, sub, val, showBar, bar }) {
   );
 }
 
+// -- Pipeline View ------------------------------------------------------------
+function PipelineView({ data }) {
+  if (!data) {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: 300 }}>
+        <div className="empty-state">Chargement du pipeline...</div>
+      </div>
+    );
+  }
+
+  const { containers, workers, binance, computed_at } = data;
+
+  const containerEntries = Object.entries(containers || {});
+  const workerEntries = Object.entries(workers || {}).sort((a, b) => parseInt(a[0]) - parseInt(b[0]));
+  const activeWorkerCount = workerEntries.filter(([, v]) => v === 'active').length;
+  // Each container value is either a string or { health, status } object (from health-dashboard)
+  const getContainerStatus = (v) => (v && typeof v === 'object') ? v.status : v;
+  const runningContainerCount = containerEntries.filter(([, v]) => getContainerStatus(v) === 'running').length;
+  const binanceOk = binance?.status === 'connected';
+
+  const displayNames = {
+    kafka: 'Kafka',
+    'kafka-ui': 'Kafka UI',
+    mongodb: 'MongoDB',
+    redis: 'Redis',
+    'producer-binance': 'Binance Producer',
+    'producer-coinbase': 'Coinbase Producer',
+    'stream-processor': 'Stream Processor',
+    'health-dashboard': 'Health Dashboard',
+    'api-server': 'API Server',
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+      {/* KPI summary row */}
+      <div className="kpis">
+        <div className="card kpi">
+          <div className="kpi-head">
+            <span className="kpi-label">Containers</span>
+            <span className={'kpi-icon ' + (runningContainerCount === containerEntries.length && containerEntries.length > 0 ? 'green' : 'rose')}>
+              <Icon name="server" size={16} />
+            </span>
+          </div>
+          <div>
+            <div className="kpi-value mono">{runningContainerCount} / {containerEntries.length || '--'}</div>
+            <div className="kpi-foot">
+              <span style={{ color: runningContainerCount === containerEntries.length && containerEntries.length > 0 ? 'var(--up)' : 'var(--down)' }}>
+                {containerEntries.length === 0 ? 'Aucun detecte' : runningContainerCount === containerEntries.length ? 'Tous operationnels' : `${containerEntries.length - runningContainerCount} arrete(s)`}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div className="card kpi">
+          <div className="kpi-head">
+            <span className="kpi-label">Stream Workers</span>
+            <span className={'kpi-icon ' + (activeWorkerCount === 8 ? 'green' : activeWorkerCount > 0 ? 'amber' : 'rose')}>
+              <Icon name="volume" size={16} />
+            </span>
+          </div>
+          <div>
+            <div className="kpi-value mono">{activeWorkerCount} / 8</div>
+            <div className="kpi-foot">
+              <span style={{ color: activeWorkerCount === 8 ? 'var(--up)' : activeWorkerCount > 0 ? 'var(--warn)' : 'var(--down)' }}>
+                {activeWorkerCount === 8 ? 'Tous actifs' : `${8 - activeWorkerCount} inactif(s)`}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div className="card kpi">
+          <div className="kpi-head">
+            <span className="kpi-label">Binance WebSocket</span>
+            <span className={'kpi-icon ' + (binanceOk ? 'green' : 'rose')}>
+              <Icon name="trend" size={16} />
+            </span>
+          </div>
+          <div>
+            <div className="kpi-value mono" style={{ fontSize: '1.15rem', color: binanceOk ? 'var(--up)' : 'var(--down)' }}>
+              {binanceOk ? 'CONNECTE' : 'DECONNECTE'}
+            </div>
+            <div className="kpi-foot">
+              <span>{binance?.age_sec != null ? `Derniere donnee : ${binance.age_sec}s` : 'Aucune donnee'}</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="card kpi">
+          <div className="kpi-head">
+            <span className="kpi-label">Derniere mise a jour</span>
+            <span className="kpi-icon blue"><Icon name="pulse" size={16} /></span>
+          </div>
+          <div>
+            <div className="kpi-value mono">{computed_at ? timeStr(new Date(computed_at)) : '--'}</div>
+            <div className="kpi-foot"><span>UTC -- Auto-refresh 5s</span></div>
+          </div>
+        </div>
+      </div>
+
+      {/* Main content: containers + workers */}
+      <div className="main-row">
+        {/* Containers list */}
+        <div className="card" style={{ flex: '1 1 0' }}>
+          <div className="sect-head">
+            <h3>Docker Containers</h3>
+            <span className="meta">{runningContainerCount} / {containerEntries.length} running</span>
+          </div>
+          <div className="health-list">
+            {containerEntries.length === 0 ? (
+              <div className="empty-state">Health dashboard inaccessible</div>
+            ) : (
+              containerEntries.map(([name, info]) => {
+                const st = getContainerStatus(info);
+                const health = (info && typeof info === 'object') ? info.health : null;
+                return (
+                <HealthRow
+                  key={name}
+                  status={st === 'running' ? 'ok' : 'err'}
+                  name={displayNames[name] || name}
+                  sub={health ? `${health} -- ${name}` : name}
+                  val={st || 'unknown'}
+                />
+              );
+              })
+            )}
+          </div>
+        </div>
+
+        {/* Workers grid */}
+        <div className="card feed-card">
+          <div className="sect-head">
+            <h3>Stream Workers</h3>
+            <span className="meta">Consumer group: group-ingestion</span>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, padding: '4px 0' }}>
+            {workerEntries.map(([id, status]) => {
+              const active = status === 'active';
+              return (
+                <div key={id} style={{
+                  display: 'flex', flexDirection: 'column', alignItems: 'center',
+                  padding: '18px 8px', borderRadius: 10,
+                  border: `1px solid ${active ? '#dcfce7' : '#fee2e2'}`,
+                  background: active ? '#f0fdf4' : '#fff1f2',
+                  gap: 8,
+                }}>
+                  <span style={{
+                    fontSize: '1rem', fontWeight: 700, fontFamily: 'JetBrains Mono',
+                    color: active ? '#166534' : '#991b1b',
+                  }}>
+                    W{id}
+                  </span>
+                  <span style={{
+                    fontSize: '0.62rem', fontWeight: 700, letterSpacing: '0.06em',
+                    padding: '3px 10px', borderRadius: 99,
+                    background: active ? '#22c55e' : '#ef4444',
+                    color: '#fff',
+                  }}>
+                    {active ? 'ACTIF' : 'INACTIF'}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Binance data age indicator */}
+          {binance?.age_sec != null && (
+            <div style={{ marginTop: 20 }}>
+              <div className="sect-head" style={{ marginBottom: 8 }}>
+                <h3>Binance -- Fraicheur des donnees</h3>
+              </div>
+              <HealthRow
+                status={binanceOk ? 'ok' : 'err'}
+                name="BTC/USDT -- kpi:price"
+                sub="Derniere ecriture Redis par les workers"
+                val={binance.age_sec != null ? `${binance.age_sec}s` : 'N/A'}
+                showBar={binance.age_sec != null}
+                bar={binanceOk ? Math.max(0, 1 - binance.age_sec / 10) : 0}
+              />
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// -- Placeholder View ---------------------------------------------------------
+function PlaceholderView({ label }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: 400, gap: 12 }}>
+      <div style={{ fontSize: '2rem', color: 'var(--muted)', lineHeight: 1 }}>[ ]</div>
+      <h2 style={{ color: 'var(--fg)', fontWeight: 600, margin: 0 }}>{label}</h2>
+      <p style={{ color: 'var(--muted)', margin: 0 }}>Cette section est en cours de developpement.</p>
+    </div>
+  );
+}
+
 
 // -- Application principale ---------------------------------------------------
-// Toute la logique de donnees passe par Socket.IO. Le serveur API lit les
-// metriques depuis Redis (pre-calculees par le stream-processor) et nous
-// les pousse toutes les 500ms. On ne fait jamais de requete directe a Kafka
-// ni a MongoDB depuis le dashboard, comme le demande le sujet.
-
 function App() {
-  // Etat des donnees temps reel
   const [lastPrice, setLastPrice] = useState(null);
   const [changePct, setChangePct] = useState(0);
   const [coinbasePrice, setCoinbasePrice] = useState(null);
@@ -233,20 +418,17 @@ function App() {
   const [alerts, setAlerts] = useState([]);
   const [volumes, setVolumes] = useState({ '1m': 0, '5m': 0, '15m': 0, '1h': 0 });
   const [health, setHealth] = useState(null);
+  const [pipelineData, setPipelineData] = useState(null);
+  const [latencyMs, setLatencyMs] = useState(null);
   const [connected, setConnected] = useState(false);
   const [now, setNow] = useState(new Date());
 
-  // Etat UI (navigation, filtres)
   const [activeNav, setActiveNav] = useState('Live');
   const [activeRange, setActiveRange] = useState('30m');
   const [activeFeed, setActiveFeed] = useState('All');
 
-  // Reference pour savoir quand on a ajoute le dernier point au graphique.
-  // On echantillonne toutes les 3 secondes pour ne pas surcharger le SVG
-  // avec trop de points (30 min / 3s = 600 points max).
   const lastChartUpdate = useRef(0);
 
-  // Connexion Socket.IO : on recoit les donnees temps reel du serveur API
   useEffect(() => {
     const socket = io();
 
@@ -256,19 +438,15 @@ function App() {
     socket.on('realtime', (data) => {
       setNow(new Date());
 
-      // Prix BTC/USDT depuis Binance
       const btcusdt = data.prices['BTC/USDT'];
       if (btcusdt && btcusdt.price) {
         const p = parseFloat(btcusdt.price);
         setLastPrice(p);
         setChangePct(parseFloat(btcusdt.change_pct_1h) || 0);
 
-        // On ajoute le prix a la serie du graphique, mais on echantillonne
-        // pour ne pas avoir 2 points par seconde (le WebSocket pousse toutes les 500ms)
         const nowMs = Date.now();
         setSeries(prev => {
           if (nowMs - lastChartUpdate.current < 3000) {
-            // On met a jour le dernier point au lieu d'en ajouter un nouveau
             if (prev.length === 0) return [{ t: nowMs, p }];
             const next = [...prev];
             next[next.length - 1] = { t: nowMs, p };
@@ -276,29 +454,25 @@ function App() {
           }
           lastChartUpdate.current = nowMs;
           const next = [...prev, { t: nowMs, p }];
-          if (next.length > 600) next.shift();
+          if (next.length > 1200) next.shift();
           return next;
         });
       }
 
-      // Prix BTC-USD depuis Coinbase
       const btcusd = data.prices['BTC-USD'];
       if (btcusd && btcusd.price) {
         setCoinbasePrice(parseFloat(btcusd.price));
         setCoinbaseChange(parseFloat(btcusd.change_pct_1h) || 0);
       }
 
-      // Throughput (trades par seconde)
       if (data.throughput && data.throughput.trades_per_sec) {
         setTradesPerSec(parseInt(data.throughput.trades_per_sec) || 0);
       }
 
-      // Nombre d'anomalies sur les 10 dernieres minutes
       if (data.anomalies && data.anomalies.count_10min) {
         setAnomalyCount(parseInt(data.anomalies.count_10min) || 0);
       }
 
-      // Derniers trades pour le feed live
       if (data.trades && data.trades.length > 0) {
         setTrades(data.trades.map((t, i) => ({
           id: t.trade_id || `${Date.now()}-${i}`,
@@ -311,7 +485,6 @@ function App() {
         })));
       }
 
-      // Alertes d'anomalies
       if (data.alerts) {
         setAlerts(data.alerts.map((a, i) => ({
           id: `${a.timestamp}-${i}`,
@@ -322,7 +495,8 @@ function App() {
         })));
       }
 
-      // Volumes par fenetre glissante
+      if (data.latency_ms !== undefined) setLatencyMs(data.latency_ms);
+
       const btcWindows = data.windows['BTC/USDT'] || {};
       setVolumes({
         '1m': parseFloat((btcWindows['1min'] || {}).volume_usd) || 0,
@@ -335,9 +509,6 @@ function App() {
     return () => socket.disconnect();
   }, []);
 
-  // Sante du pipeline : on interroge l'endpoint REST toutes les 5 secondes.
-  // On ne met pas ca dans le flux WebSocket parce que ces donnees changent
-  // beaucoup moins vite que les trades.
   useEffect(() => {
     const fetchHealth = () => {
       fetch('/api/health')
@@ -350,23 +521,33 @@ function App() {
     return () => clearInterval(id);
   }, []);
 
-  // Moyennes mobiles calculees a partir de la serie de prix
-  const smaShort = useMemo(() => sma(series, 8), [series]);
-  const smaLong = useMemo(() => sma(series, 30), [series]);
+  useEffect(() => {
+    const fetchPipeline = () => {
+      fetch('/api/pipeline')
+        .then(r => r.json())
+        .then(setPipelineData)
+        .catch(() => {});
+    };
+    fetchPipeline();
+    const id = setInterval(fetchPipeline, 5000);
+    return () => clearInterval(id);
+  }, []);
 
-  // Spread entre Binance et Coinbase
+  // Filtre la serie selon la fenetre active (5m/15m/30m/1h = nb de points a 3s d'interval)
+  const rangePoints = { '5m': 100, '15m': 300, '30m': 600, '1h': 1200 };
+  const displaySeries = useMemo(() => series.slice(-(rangePoints[activeRange] || 600)), [series, activeRange]);
+  const smaShort = useMemo(() => sma(displaySeries, 8), [displaySeries]);
+  const smaLong = useMemo(() => sma(displaySeries, 30), [displaySeries]);
+
   const spread = (lastPrice && coinbasePrice) ? lastPrice - coinbasePrice : null;
   const spreadBps = (spread !== null && lastPrice) ? (spread / lastPrice) * 10000 : null;
 
-  // Sparkline : on prend les 40 derniers points de prix pour la mini-courbe
   const sparkSeries = series.slice(-40).map(s => s.p);
 
-  // Filtre du feed par exchange
   const filteredTrades = activeFeed === 'All' ? trades
     : activeFeed === 'Binance' ? trades.filter(t => t.exchange === 'BIN')
     : trades.filter(t => t.exchange === 'CBP');
 
-  // Statut des exchanges (on considere connecte si on recoit des donnees)
   const binanceOk = lastPrice !== null;
   const coinbaseOk = coinbasePrice !== null;
 
@@ -380,7 +561,7 @@ function App() {
         </div>
         <div className="h-right">
           <div className="nav-pills">
-            {['Live', 'History', 'Anomalies', 'Pipeline'].map(n => (
+            {['Live', 'Pipeline', 'Anomalies', 'History'].map(n => (
               <button key={n} className={'pill ' + (activeNav === n ? 'active' : '')} onClick={() => setActiveNav(n)}>{n}</button>
             ))}
           </div>
@@ -393,275 +574,298 @@ function App() {
         </div>
       </div>
 
-      {/* TICKER */}
-      <div className="ticker">
-        <div className="tk">
-          <div className="tk-l">
-            <span className="tk-label">Binance -- BTC/USDT</span>
-            <span className="tk-sub">Spot -- Best Bid/Ask</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <span className="tk-price mono">{fmtNum(lastPrice, 2)}</span>
-            <span className={'tk-delta ' + (changePct >= 0 ? 'delta-up' : 'delta-down')}>
-              {changePct >= 0 ? '▲' : '▼'} {Math.abs(changePct).toFixed(2)}%
-            </span>
-          </div>
-        </div>
-        <div className="tk">
-          <div className="tk-l">
-            <span className="tk-label">Coinbase -- BTC-USD</span>
-            <span className="tk-sub">Spot -- Last Match</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <span className="tk-price mono">{fmtNum(coinbasePrice, 2)}</span>
-            {coinbasePrice !== null && (
-              <span className={'tk-delta ' + (coinbaseChange >= 0 ? 'delta-up' : 'delta-down')}>
-                {coinbaseChange >= 0 ? '▲' : '▼'} {Math.abs(coinbaseChange).toFixed(2)}%
+      {/* LIVE VIEW */}
+      {activeNav === 'Live' && <>
+        {/* TICKER */}
+        <div className="ticker">
+          <div className="tk">
+            <div className="tk-l">
+              <span className="tk-label">Binance -- BTC/USDT</span>
+              <span className="tk-sub">Spot -- Best Bid/Ask</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <span className="tk-price mono">{fmtNum(lastPrice, 2)}</span>
+              <span className={'tk-delta ' + (changePct >= 0 ? 'delta-up' : 'delta-down')}>
+                {changePct >= 0 ? '▲' : '▼'} {Math.abs(changePct).toFixed(2)}%
               </span>
-            )}
-          </div>
-        </div>
-        <div className="tk">
-          <div className="tk-l">
-            <span className="tk-label">Cross-Exchange Spread</span>
-            <span className="tk-sub">Binance - Coinbase</span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <span className="tk-price mono">
-              {spread !== null ? `${spread >= 0 ? '+' : ''}${spread.toFixed(2)}` : '--'}
-            </span>
-            {spreadBps !== null && (
-              <span className={'tk-delta ' + (Math.abs(spreadBps) > 5 ? 'delta-down' : 'delta-flat')}>
-                {spreadBps.toFixed(1)} bps
-              </span>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* KPI CARDS */}
-      <div className="kpis">
-        <KpiCard
-          icon="trend" iconClass="blue"
-          label="BTC/USDT Price"
-          value={fmtUSD(lastPrice, 2)}
-          delta={changePct}
-          deltaLabel="vs 1h ago"
-          sparkData={sparkSeries}
-          sparkColor="#3b82f6"
-        />
-        <KpiCard
-          icon="volume" iconClass="green"
-          label="Volume -- 5min Rolling"
-          value={fmtCompact(volumes['5m'])}
-          delta={null}
-          deltaLabel={`~${fmtNum(parseInt((volumes['5m'] || 0) / ((lastPrice || 1))), 0)} trades`}
-          sparkData={sparkSeries}
-          sparkColor="#22c55e"
-        />
-        <KpiCard
-          icon="pulse" iconClass="amber"
-          label="Trades / Second"
-          value={fmtNum(tradesPerSec, 0)}
-          delta={null}
-          deltaLabel="Binance + Coinbase"
-          sparkData={[]}
-          sparkColor="#f59e0b"
-        />
-        <KpiCard
-          icon="bell" iconClass="rose"
-          label="Anomalies -- last 10min"
-          value={fmtNum(anomalyCount, 0)}
-          delta={null}
-          deltaLabel="Detection 3 sigma"
-          sparkData={[]}
-          sparkColor="#ef4444"
-        />
-      </div>
-
-      {/* MAIN ROW */}
-      <div className="main-row">
-        <div className="card chart-card">
-          <div className="chart-head">
-            <div>
-              <h3 className="chart-title">BTC/USDT -- Price Stream</h3>
-              <p className="chart-sub">Binance spot -- Updated every tick -- {timeStr(now)}</p>
-            </div>
-            <div className="chart-range">
-              {['5m', '15m', '30m', '1h'].map(r => (
-                <button key={r} className={'range-btn ' + (activeRange === r ? 'active' : '')} onClick={() => setActiveRange(r)}>{r}</button>
-              ))}
             </div>
           </div>
-          <PriceChart series={series} smaShort={smaShort} smaLong={smaLong} />
-          <div className="chart-legend">
-            <div className="legend-item">
-              <span className="legend-line" style={{ background: '#3b82f6' }}></span>
-              Price <span className="legend-val mono">{fmtNum(lastPrice, 2)}</span>
+          <div className="tk">
+            <div className="tk-l">
+              <span className="tk-label">Coinbase -- BTC-USD</span>
+              <span className="tk-sub">Spot -- Last Match</span>
             </div>
-            <div className="legend-item">
-              <span className="legend-line" style={{ background: '#22c55e' }}></span>
-              SMA 8 <span className="legend-val mono">{smaShort.length > 0 ? fmtNum(smaShort[smaShort.length - 1].p, 2) : '--'}</span>
-            </div>
-            <div className="legend-item">
-              <span className="legend-line" style={{ background: '#f59e0b' }}></span>
-              SMA 30 <span className="legend-val mono">{smaLong.length > 0 ? fmtNum(smaLong[smaLong.length - 1].p, 2) : '--'}</span>
-            </div>
-            {series.length > 2 && (
-              <div className="legend-item" style={{ marginLeft: 'auto' }}>
-                Range <span className="legend-val mono">
-                  {fmtNum(Math.min(...series.map(s => s.p)), 0)} -- {fmtNum(Math.max(...series.map(s => s.p)), 0)}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <span className="tk-price mono">{fmtNum(coinbasePrice, 2)}</span>
+              {coinbasePrice !== null && (
+                <span className={'tk-delta ' + (coinbaseChange >= 0 ? 'delta-up' : 'delta-down')}>
+                  {coinbaseChange >= 0 ? '▲' : '▼'} {Math.abs(coinbaseChange).toFixed(2)}%
                 </span>
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* TRADE FEED */}
-        <div className="card feed-card">
-          <div className="feed-head">
-            <h3>Recent Trades</h3>
-            <div className="feed-tabs">
-              {['All', 'Binance', 'Coinbase'].map(f => (
-                <span key={f} className={'feed-tab ' + (activeFeed === f ? 'active' : '')} onClick={() => setActiveFeed(f)}>{f}</span>
-              ))}
+              )}
             </div>
           </div>
-          <div className="feed-cols">
-            <span>Price</span>
-            <span>Qty (BTC)</span>
-            <span>Source</span>
-            <span style={{ textAlign: 'right' }}>Time</span>
-          </div>
-          <div className="feed-list">
-            {filteredTrades.length === 0 ? (
-              <div className="empty-state">En attente de trades...</div>
-            ) : (
-              filteredTrades.map(t => (
-                <div key={t.id} className="feed-row">
-                  <span className="feed-side mono" style={{ color: t.side === 'buy' ? '#15803d' : '#b91c1c' }}>
-                    <span className="side-dot" style={{ background: t.side === 'buy' ? '#22c55e' : '#ef4444' }}></span>
-                    {fmtNum(t.price, 2)}
-                  </span>
-                  <span className="feed-qty mono">{parseFloat(t.qty).toFixed(6)}</span>
-                  <span className="feed-ex">
-                    <span className="ex-tag">{t.exchange}</span>
-                  </span>
-                  <span className="feed-time mono">{timeStr(t.time)}</span>
-                </div>
-              ))
-            )}
+          <div className="tk">
+            <div className="tk-l">
+              <span className="tk-label">Cross-Exchange Spread</span>
+              <span className="tk-sub">Binance - Coinbase</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <span className="tk-price mono">
+                {spread !== null ? `${spread >= 0 ? '+' : ''}${spread.toFixed(2)}` : '--'}
+              </span>
+              {spreadBps !== null && (
+                <span className={'tk-delta ' + (Math.abs(spreadBps) > 5 ? 'delta-down' : 'delta-flat')}>
+                  {spreadBps.toFixed(1)} bps
+                </span>
+              )}
+            </div>
           </div>
         </div>
-      </div>
 
-      {/* BOTTOM ROW */}
-      <div className="bottom-row">
-        {/* ALERTS */}
-        <div className="card">
-          <div className="sect-head">
-            <h3>Real-Time Alerts</h3>
-            <span className="meta">{alerts.length} active</span>
+        {/* KPI CARDS */}
+        <div className="kpis">
+          <KpiCard
+            icon="trend" iconClass="blue"
+            label="BTC/USDT Price"
+            value={fmtUSD(lastPrice, 2)}
+            delta={changePct}
+            deltaLabel="vs 1h ago"
+            sparkData={sparkSeries}
+            sparkColor="#3b82f6"
+          />
+          <KpiCard
+            icon="volume" iconClass="green"
+            label="Volume -- 5min Rolling"
+            value={fmtCompact(volumes['5m'])}
+            delta={null}
+            deltaLabel={`~${fmtNum(parseInt((volumes['5m'] || 0) / ((lastPrice || 1))), 0)} trades`}
+            sparkData={sparkSeries}
+            sparkColor="#22c55e"
+          />
+          <KpiCard
+            icon="pulse" iconClass="amber"
+            label="Trades / Second"
+            value={fmtNum(tradesPerSec, 0)}
+            delta={null}
+            deltaLabel="Binance + Coinbase"
+            sparkData={[]}
+            sparkColor="#f59e0b"
+          />
+          <KpiCard
+            icon="bell" iconClass="rose"
+            label="Anomalies -- last 10min"
+            value={fmtNum(anomalyCount, 0)}
+            delta={null}
+            deltaLabel="Detection 3 sigma"
+            sparkData={[]}
+            sparkColor="#ef4444"
+          />
+        </div>
+
+        {/* MAIN ROW */}
+        <div className="main-row">
+          <div className="card chart-card">
+            <div className="chart-head">
+              <div>
+                <h3 className="chart-title">BTC/USDT -- Price Stream</h3>
+                <p className="chart-sub">Binance spot -- Updated every tick -- {timeStr(now)}</p>
+              </div>
+              <div className="chart-range">
+                {['5m', '15m', '30m', '1h'].map(r => (
+                  <button key={r} className={'range-btn ' + (activeRange === r ? 'active' : '')} onClick={() => setActiveRange(r)}>{r}</button>
+                ))}
+              </div>
+            </div>
+            <PriceChart series={displaySeries} smaShort={smaShort} smaLong={smaLong} />
+            <div className="chart-legend">
+              <div className="legend-item">
+                <span className="legend-line" style={{ background: '#3b82f6' }}></span>
+                Price <span className="legend-val mono">{fmtNum(lastPrice, 2)}</span>
+              </div>
+              <div className="legend-item">
+                <span className="legend-line" style={{ background: '#22c55e' }}></span>
+                SMA 8 <span className="legend-val mono">{smaShort.length > 0 ? fmtNum(smaShort[smaShort.length - 1].p, 2) : '--'}</span>
+              </div>
+              <div className="legend-item">
+                <span className="legend-line" style={{ background: '#f59e0b' }}></span>
+                SMA 30 <span className="legend-val mono">{smaLong.length > 0 ? fmtNum(smaLong[smaLong.length - 1].p, 2) : '--'}</span>
+              </div>
+              {series.length > 2 && (
+                <div className="legend-item" style={{ marginLeft: 'auto' }}>
+                  Range <span className="legend-val mono">
+                    {fmtNum(Math.min(...series.map(s => s.p)), 0)} -- {fmtNum(Math.max(...series.map(s => s.p)), 0)}
+                  </span>
+                </div>
+              )}
+            </div>
           </div>
-          <div className="alerts-list">
-            {alerts.length === 0 ? (
-              <div className="empty-state">Aucune anomalie detectee</div>
-            ) : (
-              alerts.map(a => (
-                <div key={a.id} className="alert-row">
-                  <span className={'alert-pill ' + a.kind}></span>
-                  <div className="alert-body">
-                    <div className="alert-msg">{a.msg}</div>
-                    <div className="alert-meta">
-                      <span className="alert-tag">{a.kind === 'price_anomaly' ? 'price' : a.kind === 'volume_spike' ? 'volume' : a.kind}</span>
-                      <span>{a.source}</span>
-                      <span className="mono">{timeStr(a.time)}</span>
+
+          {/* TRADE FEED */}
+          <div className="card feed-card">
+            <div className="feed-head">
+              <h3>Recent Trades</h3>
+              <div className="feed-tabs">
+                {['All', 'Binance', 'Coinbase'].map(f => (
+                  <span key={f} className={'feed-tab ' + (activeFeed === f ? 'active' : '')} onClick={() => setActiveFeed(f)}>{f}</span>
+                ))}
+              </div>
+            </div>
+            <div className="feed-cols">
+              <span>Price</span>
+              <span>Qty (BTC)</span>
+              <span>Source</span>
+              <span style={{ textAlign: 'right' }}>Time</span>
+            </div>
+            <div className="feed-list">
+              {filteredTrades.length === 0 ? (
+                <div className="empty-state">En attente de trades...</div>
+              ) : (
+                filteredTrades.map(t => (
+                  <div key={t.id} className="feed-row">
+                    <span className="feed-side mono" style={{ color: t.side === 'buy' ? '#15803d' : '#b91c1c' }}>
+                      <span className="side-dot" style={{ background: t.side === 'buy' ? '#22c55e' : '#ef4444' }}></span>
+                      {fmtNum(t.price, 2)}
+                    </span>
+                    <span className="feed-qty mono">{parseFloat(t.qty).toFixed(6)}</span>
+                    <span className="feed-ex">
+                      <span className="ex-tag">{t.exchange}</span>
+                    </span>
+                    <span className="feed-time mono">{timeStr(t.time)}</span>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* BOTTOM ROW */}
+        <div className="bottom-row">
+          {/* ALERTS */}
+          <div className="card">
+            <div className="sect-head">
+              <h3>Real-Time Alerts</h3>
+              <span className="meta">{alerts.length} active</span>
+            </div>
+            <div className="alerts-list">
+              {alerts.length === 0 ? (
+                <div className="empty-state">Aucune anomalie detectee</div>
+              ) : (
+                alerts.map(a => (
+                  <div key={a.id} className="alert-row">
+                    <span className={'alert-pill ' + a.kind}></span>
+                    <div className="alert-body">
+                      <div className="alert-msg">{a.msg}</div>
+                      <div className="alert-meta">
+                        <span className="alert-tag">{a.kind === 'price_anomaly' ? 'price' : a.kind === 'volume_spike' ? 'volume' : a.kind}</span>
+                        <span>{a.source}</span>
+                        <span className="mono">{timeStr(a.time)}</span>
+                      </div>
                     </div>
                   </div>
-                </div>
-              ))
-            )}
+                ))
+              )}
+            </div>
           </div>
-        </div>
 
-        {/* VOLUME WINDOWS */}
-        <div className="card">
-          <div className="sect-head">
-            <h3>Volume by Window</h3>
-            <span className="meta">USD notional</span>
-          </div>
-          <div className="vol-list">
-            {[
-              { k: '1m', label: '1 minute' },
-              { k: '5m', label: '5 minutes' },
-              { k: '15m', label: '15 minutes' },
-              { k: '1h', label: '1 hour' }
-            ].map(v => {
-              const val = volumes[v.k] || 0;
-              // On calibre les barres par rapport au volume 1h (le plus grand)
-              const maxVol = volumes['1h'] || 1;
-              const pct = Math.min(100, (val / maxVol) * 100);
-              return (
-                <div key={v.k} className="vol-row">
-                  <div className="vol-top">
-                    <span className="vol-label">{v.label}</span>
-                    <span className="vol-val mono">{fmtCompact(val)}</span>
+          {/* VOLUME WINDOWS */}
+          <div className="card">
+            <div className="sect-head">
+              <h3>Volume by Window</h3>
+              <span className="meta">USD notional</span>
+            </div>
+            <div className="vol-list">
+              {[
+                { k: '1m', label: '1 minute' },
+                { k: '5m', label: '5 minutes' },
+                { k: '15m', label: '15 minutes' },
+                { k: '1h', label: '1 hour' }
+              ].map(v => {
+                const val = volumes[v.k] || 0;
+                const maxVol = volumes['1h'] || 1;
+                const pct = Math.min(100, (val / maxVol) * 100);
+                return (
+                  <div key={v.k} className="vol-row">
+                    <div className="vol-top">
+                      <span className="vol-label">{v.label}</span>
+                      <span className="vol-val mono">{fmtCompact(val)}</span>
+                    </div>
+                    <div className="vol-bar"><div className="vol-fill" style={{ width: pct + '%' }}></div></div>
                   </div>
-                  <div className="vol-bar"><div className="vol-fill" style={{ width: pct + '%' }}></div></div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
-        </div>
 
-        {/* PIPELINE HEALTH */}
-        <div className="card">
-          <div className="sect-head">
-            <h3>Pipeline Health</h3>
-            <span className="meta mono">{connected ? 'connected' : 'disconnected'}</span>
-          </div>
-          <div className="health-list">
-            {health ? (
-              <>
-                <HealthRow
-                  status={health.redis === 'connected' ? 'ok' : 'err'}
-                  name="Redis"
-                  sub="Cache temps reel et metriques"
-                  val={health.redis}
-                />
-                <HealthRow
-                  status={health.mongodb === 'connected' ? 'ok' : 'err'}
-                  name="MongoDB"
-                  sub="Stockage permanent des trades"
-                  val={health.mongodb}
-                />
-                <HealthRow
-                  status={binanceOk ? 'ok' : 'err'}
-                  name="WebSocket Binance"
-                  sub="BTC/USDT stream"
-                  val={binanceOk ? 'connected' : 'waiting'}
-                />
-                <HealthRow
-                  status={coinbaseOk ? 'ok' : 'warn'}
-                  name="WebSocket Coinbase"
-                  sub="BTC-USD stream"
-                  val={coinbaseOk ? 'connected' : 'waiting'}
-                />
-                <HealthRow
-                  status={health.active_workers === health.total_workers ? 'ok' : health.active_workers > 0 ? 'warn' : 'err'}
-                  name="Stream Workers"
-                  sub="Consumer group: crypto-processor"
-                  val={`${health.active_workers} / ${health.total_workers} active`}
-                  showBar
-                  bar={health.active_workers / health.total_workers}
-                />
-              </>
-            ) : (
-              <div className="empty-state">Chargement...</div>
-            )}
+          {/* PIPELINE HEALTH */}
+          <div className="card">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+              <Icon name="server" size={13} stroke={2} />
+              <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)' }}>
+                Pipeline -- Sante Systeme
+              </span>
+            </div>
+            <div className="health-list">
+              {health ? (
+                <>
+                  <HealthRow
+                    status={binanceOk ? 'ok' : 'err'}
+                    name="WebSocket Binance"
+                    sub=""
+                    val={binanceOk ? 'connecte' : 'deconnecte'}
+                  />
+                  <HealthRow
+                    status={coinbaseOk ? 'ok' : 'warn'}
+                    name="WebSocket Coinbase"
+                    sub=""
+                    val={coinbaseOk ? 'connecte' : 'deconnecte'}
+                  />
+                  <HealthRow
+                    status={health.active_workers > 0 ? 'ok' : 'err'}
+                    name="Kafka broker"
+                    sub=""
+                    val={health.active_workers > 0 ? 'actif' : 'inactif'}
+                  />
+                  <HealthRow
+                    status={health.active_workers === health.total_workers ? 'ok' : health.active_workers > 0 ? 'warn' : 'err'}
+                    name="Consumer group"
+                    sub=""
+                    val={`${health.active_workers} / ${health.total_workers} actifs`}
+                  />
+                  <HealthRow
+                    status={health.mongodb === 'connected' ? 'ok' : 'err'}
+                    name="Base de donnees"
+                    sub=""
+                    val="MongoDB"
+                  />
+                  <div className="health-row">
+                    <div className="h-left"><div className="h-name">Debit ingestion</div></div>
+                    <div className="h-val mono" style={{ fontWeight: 600, color: 'var(--ink)' }}>
+                      ~{tradesPerSec} msg/s
+                    </div>
+                  </div>
+                  <div className="health-row" style={{ borderBottom: 'none' }}>
+                    <div className="h-left"><div className="h-name">Latence pipeline</div></div>
+                    <div className="h-val mono" style={{ fontWeight: 600, color: latencyMs === null ? 'var(--muted)' : latencyMs > 2000 ? 'var(--warn)' : 'var(--up)' }}>
+                      {latencyMs === null ? '--' : latencyMs > 2000 ? `△ ${latencyMs}ms` : `${latencyMs}ms`}
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="empty-state">Chargement...</div>
+              )}
+            </div>
           </div>
         </div>
-      </div>
+      </>}
+
+      {/* PIPELINE VIEW */}
+      {activeNav === 'Pipeline' && <PipelineView data={pipelineData} />}
+
+      {/* ANOMALIES VIEW */}
+      {activeNav === 'Anomalies' && <PlaceholderView label="Anomalies" />}
+
+      {/* HISTORY VIEW */}
+      {activeNav === 'History' && <PlaceholderView label="History" />}
 
       {/* FOOTER */}
       <div className="footer">

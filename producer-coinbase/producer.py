@@ -53,7 +53,8 @@ def on_message(ws, message):
     # les trades reellement executes sur le carnet d'ordres.
     if data.get("type") in ("match", "last_match"):
         trade = normalize(data)
-        producer.send(KAFKA_TOPIC, trade)
+        key = trade['trade_id'].encode()
+        producer.send(KAFKA_TOPIC, value=trade, key=key)
         logger.info(f"-> Kafka | price={trade['price']:.2f} qty={trade['quantity']:.6f}")
 
 

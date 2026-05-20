@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from collections import deque
+from datetime import datetime, timezone
 
 import redis
 from kafka import KafkaConsumer
@@ -68,11 +69,11 @@ consumer = KafkaConsumer(
     auto_offset_reset="latest",
 )
 
-# Buffers en memoire pour le calcul des anomalies. On utilise des deque
-# a taille fixe pour que les anciens prix/volumes soient automatiquement
-# ejectes quand de nouveaux arrivent.
-price_buffer  = deque(maxlen=ANOMALY_BUF_SIZE)
-volume_buffer = deque(maxlen=ANOMALY_BUF_SIZE)
+# Buffers par symbole : BTC/USDT et BTC-USD ont des prix differents (~70$ d'ecart).
+# Melanger les deux dans un meme buffer genere de fausses anomalies (l'ecart
+# de prix entre exchanges depasse souvent 3 sigma si le buffer est mixte).
+price_buffers  = {}   # { symbol: deque }
+volume_buffers = {}   # { symbol: deque }
 
 logger.info("Demarre -- en attente de messages...")
 
@@ -162,7 +163,8 @@ for msg in consumer:
 
         r.hset(f"kpi:price:{symbol}", mapping={
             "price":         price,
-            "timestamp":     ts,
+            "timestamp":     datetime.now(timezone.utc).isoformat(),
+            "trade_ts":      ts,
             "exchange":      trade["exchange"],
             "change_pct_1h": change_pct_1h,
         })
@@ -188,18 +190,19 @@ for msg in consumer:
         })
 
         # -- 6. Detection d'anomalies ----------------------------------------
-        # On maintient un buffer glissant de prix et de volumes. Quand on a
-        # assez d'echantillons, on verifie si le trade actuel sort de la norme.
-        # Deux types d'anomalies :
-        # - prix anormal : le prix s'ecarte de plus de 3 ecarts-types
-        # - pic de volume : le volume est 5x superieur a la moyenne
-        price_buffer.append(price)
-        volume_buffer.append(qty)
+        # Buffers separes par symbole pour eviter les fausses alertes dues
+        # au melange BTC/USDT (~77480) et BTC-USD (~77410).
+        if symbol not in price_buffers:
+            price_buffers[symbol]  = deque(maxlen=ANOMALY_BUF_SIZE)
+            volume_buffers[symbol] = deque(maxlen=ANOMALY_BUF_SIZE)
 
-        if len(price_buffer) >= MIN_SAMPLES:
-            avg_p = _mean(price_buffer)
-            std_p = _std(price_buffer, avg_p)
-            avg_v = _mean(volume_buffer)
+        price_buffers[symbol].append(price)
+        volume_buffers[symbol].append(qty)
+
+        if len(price_buffers[symbol]) >= MIN_SAMPLES:
+            avg_p = _mean(price_buffers[symbol])
+            std_p = _std(price_buffers[symbol], avg_p)
+            avg_v = _mean(volume_buffers[symbol])
             alert = None
 
             if std_p > 0 and abs(price - avg_p) > SIGMA_THRESHOLD * std_p:
